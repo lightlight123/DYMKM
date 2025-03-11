@@ -1,1 +1,0 @@
-cmd_/home/lll/dynamic-measurement/new/memory_reader.ko := ld -r  -m elf_x86_64 -z noexecstack   --build-id=sha1  -T scripts/module.lds -o /home/lll/dynamic-measurement/new/memory_reader.ko /home/lll/dynamic-measurement/new/memory_reader.o /home/lll/dynamic-measurement/new/memory_reader.mod.o;  true
