@@ -9,8 +9,9 @@
 		{ 0xbd, 0x7e, 0x97, 0x21, 0x29, 0x60, 0x4e, 0x0c } }
 
 #define TA_CMD_ENQUEUE 0
+#define TA_CMD_PROCESS 1
 
-#define MAX_BATCH_SIZE 1024
+#define MAX_BATCH_SIZE 8
 #define TEE_HASH_SHA256_SIZE 32
 
 struct controlflow_info {
@@ -29,13 +30,23 @@ struct shm_control {
     _Atomic(uint32_t) tail;
     uint32_t buffer_size;
     _Atomic(uint32_t) lock;     
-    _Atomic(uint) new_message; //新消息标志
+    _Atomic(uint32_t) new_message; //新消息标志
+    _Atomic(uint32_t) verify_ok;   //验证成功标志
 };
 
+// 新增基线控制块
+struct hash_baseline {
+    uint8_t initial_hash[TEE_HASH_SHA256_SIZE]; // 链式哈希初始值
+    uint32_t generation;                       // 基线版本号
+    atomic_int locked;                          // 基线更新锁
+};
+
+// 共享内存上下文结构
 struct shared_mem_ctx {
-    void *shm_base;
-    struct shm_control *ctrl;           //控制区
-    struct controlflow_info *data_area; //数据区
+    void *shm_base;                  // 共享内存基地址
+    struct shm_control *ctrl;        // 队列控制块
+    struct hash_baseline *baseline;  // 哈希基线块 
+    struct controlflow_info *data_area; // 数据存储区
 };
 
 #endif /* __SHARED_MEM_TA_H__ */
