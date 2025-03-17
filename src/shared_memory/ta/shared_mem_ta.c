@@ -1,200 +1,98 @@
 #include <tee_internal_api.h>
 #include <tee_internal_api_extensions.h>
-#include "shared_mem_ta.h"
 #include <string.h>
-
-typedef struct {
-    size_t capacity;
-    size_t head;
-    size_t tail;
-    size_t count;
-    uint8_t buffer[];
-} secure_queue_t;
-
-// 先声明函数
-static TEE_Result init_queue(uint32_t paramTypes, TEE_Param params[4]);
-static TEE_Result handle_enqueue(uint32_t paramTypes, TEE_Param params[4]);
-static TEE_Result handle_dequeue(uint32_t paramTypes, TEE_Param params[4]);
-
-static secure_queue_t *queue = NULL;
-static uint8_t *data_buffer = NULL;
+#include "shared_mem_ta.h"
 
 TEE_Result TA_CreateEntryPoint(void) {
-    DMSG("TA Create Entry Point");
     return TEE_SUCCESS;
 }
 
 void TA_DestroyEntryPoint(void) {
-    if (queue) {
-        TEE_Free(queue);
-        queue = NULL;
-    }
-    data_buffer = NULL;
-    DMSG("TA Destroyed");
 }
 
-TEE_Result TA_OpenSessionEntryPoint(uint32_t paramTypes, TEE_Param params[4], void **sessionContext) {
-    (void)paramTypes;
-    (void)params;
-
-    queue = TEE_Malloc(sizeof(secure_queue_t) + 4096, TEE_MALLOC_FILL_ZERO);
-    if (!queue) {
-        EMSG("Failed to allocate queue memory");
-        return TEE_ERROR_OUT_OF_MEMORY;
-    }
-
-    queue->capacity = 4096;
-    queue->head = queue->tail = queue->count = 0;
-    data_buffer = queue->buffer;
-
-    *sessionContext = queue;
-    DMSG("TA Opened. Queue allocated at %p", queue);
-    return TEE_SUCCESS;
-}
-
-void TA_CloseSessionEntryPoint(void *sessionContext) {
-    if (sessionContext) {
-        TEE_Free(sessionContext);
-    }
-    queue = NULL;
-    data_buffer = NULL;
-    DMSG("TA Closed");
-}
-
-TEE_Result TA_InvokeCommandEntryPoint(void *sessionContext, uint32_t cmdID, uint32_t paramTypes, TEE_Param params[4]) {
-    if (!sessionContext) {
-        EMSG("Invalid session context");
-        return TEE_ERROR_BAD_STATE;
-    }
-
-    queue = (secure_queue_t *)sessionContext;
-    data_buffer = queue->buffer;
-
-    switch (cmdID) {
-        case TA_CMD_INIT_QUEUE:
-            return init_queue(paramTypes, params);
-        case TA_CMD_ENQUEUE:
-            return handle_enqueue(paramTypes, params);
-        case TA_CMD_DEQUEUE:
-            return handle_dequeue(paramTypes, params);
-        default:
-            EMSG("Unknown command ID: 0x%x", cmdID);
-            return TEE_ERROR_NOT_SUPPORTED;
-    }
-}
-
-static TEE_Result init_queue(uint32_t paramTypes, TEE_Param params[4]) {
-    if (paramTypes != TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INOUT,
-                                      TEE_PARAM_TYPE_VALUE_INPUT,
-                                      TEE_PARAM_TYPE_NONE,
-                                      TEE_PARAM_TYPE_NONE)) {
-        EMSG("Bad parameters in init_queue");
-        return TEE_ERROR_BAD_PARAMETERS;
-    }
-
-    queue = (secure_queue_t *)params[0].memref.buffer;
-    queue->capacity = params[1].value.a;
-
-    if (queue->capacity > params[0].memref.size - sizeof(secure_queue_t)) {
-        EMSG("Queue capacity exceeds shared memory size");
-        return TEE_ERROR_SHORT_BUFFER;
-    }
-
-    queue->head = queue->tail = queue->count = 0;
-    data_buffer = queue->buffer;
-    DMSG("Queue initialized. Capacity: %zu", queue->capacity);
-    return TEE_SUCCESS;
-}
-
-static TEE_Result handle_enqueue(uint32_t paramTypes, TEE_Param params[4]) {
-    if (paramTypes != TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
-                                      TEE_PARAM_TYPE_VALUE_INPUT,
-                                      TEE_PARAM_TYPE_NONE,
-                                      TEE_PARAM_TYPE_NONE)) {
-        EMSG("Bad parameters in handle_enqueue");
-        return TEE_ERROR_BAD_PARAMETERS;
-    }
-
-    if (!queue || !data_buffer) {
-        EMSG("Queue or data buffer is NULL");
-        return TEE_ERROR_BAD_STATE;
-    }
-
-    size_t data_len = params[1].value.a;
-    if (data_len == 0 || data_len > params[0].memref.size) {
-        EMSG("Invalid data length: %zu", data_len);
-        return TEE_ERROR_BAD_PARAMETERS;
-    }
-
-    if (queue->count + data_len > queue->capacity) {
-        EMSG("Not enough space in queue for data. Queue count: %zu, Data len: %zu", queue->count, data_len);
-        return TEE_ERROR_OUT_OF_MEMORY;
-    }
-
-    size_t write_pos = queue->head;
-    size_t first_chunk = queue->capacity - write_pos;
-
-    if (data_len <= first_chunk) {
-        memcpy(&data_buffer[write_pos], params[0].memref.buffer, data_len);
-    } else {
-        memcpy(&data_buffer[write_pos], params[0].memref.buffer, first_chunk);
-        memcpy(data_buffer, (uint8_t *)params[0].memref.buffer + first_chunk, data_len - first_chunk);
-    }
-
-    queue->head = (queue->head + data_len) % queue->capacity;
-    queue->count += data_len;
-    DMSG("Enqueued data. New head: %zu, count: %zu", queue->head, queue->count);
-    return TEE_SUCCESS;
-}
-
-static TEE_Result handle_dequeue(uint32_t paramTypes, TEE_Param params[4]) {
-    if (paramTypes != TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_OUTPUT,
-                                      TEE_PARAM_TYPE_VALUE_OUTPUT,
-                                      TEE_PARAM_TYPE_NONE,
-                                      TEE_PARAM_TYPE_NONE)) {
-        return TEE_ERROR_BAD_PARAMETERS;
-    }
-
-    if (!queue || !data_buffer || queue->count == 0) {
-        return TEE_ERROR_NO_DATA;
-    }
-
-    // 获取请求的大小
-    size_t requested_size = params[0].memref.size;
+TEE_Result TA_OpenSessionEntryPoint(uint32_t param_types,
+                                    TEE_Param params[4],
+                                    void **sess_ctx) {
+    struct shared_mem_ctx *ctx;
+    //共享内存大小
+    size_t shm_size = sizeof(struct shm_control) + MAX_BATCH_SIZE * sizeof(struct controlflow_info);
     
-    // 获取队列中当前可用的字节数
-    size_t available_data = queue->count;
-
-    // 打印调试信息，查看请求的大小和队列当前的可用数据量
-    DMSG("Requested size: %zu, Available data: %zu", requested_size, available_data);
-
-    // 如果请求的大小大于队列中的数据，则调整为队列中可用的数据量
-    if (requested_size > available_data) {
-        requested_size = available_data;
+    ctx = TEE_Malloc(sizeof(struct shared_mem_ctx), TEE_MALLOC_FILL_ZERO);
+    if (!ctx)
+        return TEE_ERROR_OUT_OF_MEMORY;
+    
+    ctx->shm_base = TEE_Malloc(shm_size, TEE_MALLOC_FILL_ZERO);
+    if (!ctx->shm_base) {
+        TEE_Free(ctx);
+        return TEE_ERROR_OUT_OF_MEMORY;
     }
-
-    // 设置返回的实际大小
-    params[1].value.a = requested_size;
-
-    size_t read_pos = queue->tail;
-    size_t first_chunk = queue->capacity - read_pos;
-
-    // 如果请求的大小小于等于从尾部到队列末尾的数据量，直接复制
-    if (requested_size <= first_chunk) {
-        memcpy(params[0].memref.buffer, &data_buffer[read_pos], requested_size);
-    } else {
-        // 如果请求的大小大于从尾部到队列末尾的数据量，则分两次复制
-        memcpy(params[0].memref.buffer, &data_buffer[read_pos], first_chunk);
-        memcpy((uint8_t *)params[0].memref.buffer + first_chunk, data_buffer, requested_size - first_chunk);
-    }
-
-    // 更新队列的尾部和数据计数
-    queue->tail = (queue->tail + requested_size) % queue->capacity;  // 确保tail环绕
-    queue->count -= requested_size;
-
-    // 打印调试信息，显示出队列状态
-    DMSG("Dequeued %zu bytes. Queue state - head: %zu, tail: %zu, count: %zu",
-         requested_size, queue->head, queue->tail, queue->count);
-
+    
+    ctx->ctrl = (struct shm_control *)ctx->shm_base;
+    ctx->data_area = (struct controlflow_info *)((char *)ctx->shm_base + sizeof(struct shm_control));
+    
+    atomic_init(&ctx->ctrl->head, 0);
+    atomic_init(&ctx->ctrl->tail, 0);
+    ctx->ctrl->buffer_size = MAX_BATCH_SIZE;
+    atomic_init(&ctx->ctrl->lock, 0);
+    
+    *sess_ctx = ctx;
     return TEE_SUCCESS;
+}
+
+void TA_CloseSessionEntryPoint(void *sess_ctx) {
+    struct shared_mem_ctx *ctx = (struct shared_mem_ctx *)sess_ctx;
+    if (ctx) {
+        TEE_Free(ctx->shm_base);
+        TEE_Free(ctx);
+    }
+}
+
+static TEE_Result enqueue_batch(struct shared_mem_ctx *ctx, struct controlflow_batch *batch) {
+    uint32_t head, tail, free_space;
+    const uint32_t buffer_size = ctx->ctrl->buffer_size;
+
+    //使用原子操作加载head和tail的值，确保同步访问。
+    //memory_order_acquire 表示获取操作之前的所有读取操作不能被重排到获取操作之后。
+    head = atomic_load_explicit(&ctx->ctrl->head, memory_order_acquire);
+    tail = atomic_load_explicit(&ctx->ctrl->tail, memory_order_acquire);
+    
+    free_space = (buffer_size + tail - head - 1) & (buffer_size - 1);
+    if (free_space < batch->batch_size)
+        return TEE_ERROR_SHORT_BUFFER;
+
+    //通过原子交换 (atomic_exchange_explicit)操作尝试获取lock锁。
+    //如果当前锁已被其他线程持有，atomic_exchange_explicit会返回非零值，然后调用TEE_Wait(10)等待10毫秒后重试。
+    //这确保只有一个线程可以写入缓冲区。
+    while (atomic_exchange_explicit(&ctx->ctrl->lock, 1, memory_order_acq_rel) != 0)
+        TEE_Wait(10);
+    //写入控制流信息到缓冲区
+    for (uint32_t i = 0; i < batch->batch_size; i++) {
+        uint32_t pos = (head + i) % buffer_size;
+        memcpy(&ctx->data_area[pos], &batch->data[i], sizeof(struct controlflow_info));
+    }
+    //更新head
+    atomic_store_explicit(&ctx->ctrl->head, (head + batch->batch_size) % buffer_size, memory_order_release);
+    //设置new_message为1，表示有新消息可以处理
+    atomic_store_explicit(&ctx->ctrl->new_message, 1, memory_order_release);
+    //释放锁
+    atomic_store_explicit(&ctx->ctrl->lock, 0, memory_order_release);
+    
+    return TEE_SUCCESS;
+}
+
+TEE_Result TA_InvokeCommandEntryPoint(void *sess_ctx,
+                                      uint32_t cmd_id,
+                                      uint32_t param_types,
+                                      TEE_Param params[4]) {
+    struct shared_mem_ctx *ctx = (struct shared_mem_ctx *)sess_ctx;
+    struct controlflow_batch *batch;
+
+    if (cmd_id == TA_CMD_ENQUEUE) {
+        if (param_types != TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT, TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE))
+            return TEE_ERROR_BAD_PARAMETERS;
+
+        batch = (struct controlflow_batch *)params[0].memref.buffer;
+        return enqueue_batch(ctx, batch);
+    }
+    return TEE_ERROR_NOT_IMPLEMENTED;
 }
