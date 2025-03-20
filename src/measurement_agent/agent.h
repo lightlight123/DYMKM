@@ -2,46 +2,55 @@
 #define AGENT_H
 
 #include <stdint.h>
-#include <stdatomic.h>
-#include <semaphore.h> 
-
+#include <semaphore.h>
 
 #define MAX_BATCH_SIZE 8
+#define SHM_NAME "/cf_shm"
+#define SHM_SIZE (sizeof(struct shm_control) + MAX_BATCH_SIZE * sizeof(struct controlflow_batch))
 
-// 控制流信息结构体
+// 显式声明C语言符号导出
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// 控制流信息结构体（强制8字节对齐）
 struct controlflow_info {
     uint64_t source_id;          // 基本块ID
     uint64_t addrto_offset;      // 目标地址偏移
-};
+} __attribute__((aligned(8)));
 
 // 批量控制流信息结构体
 struct controlflow_batch {
-    uint64_t batch_size;         // 不超过MAX_BATCH_SIZE
-    struct controlflow_info data[MAX_BATCH_SIZE]; // 控制流数据
-};
+    uint64_t batch_size;         
+    struct controlflow_info data[MAX_BATCH_SIZE];
+} __attribute__((aligned(8)));
 
-// 队列控制块
+// 共享内存控制块（包含进程间信号量）
 struct shm_control {
-    sem_t lock;          // 替换原子锁为信号量
-    uint32_t head;       
+    sem_t lock;          // 互斥信号量
+    sem_t data_ready;    // 数据通知信号量
+    uint32_t head;
     uint32_t tail;
     uint32_t buffer_size;
-    sem_t new_message;   // 替换原子标志
 };
 
 // 共享内存上下文
 struct shared_mem_ctx {
-    void *shm_base;              // 共享内存基地址
-    struct shm_control *ctrl;    // 队列控制块
-    struct controlflow_batch *data_area; 
-    sem_t *sem_lock;             // 互斥信号量 
-    sem_t *sem_data;             // 数据通知信号量
+    int is_creator;              // 是否为创建者
+    struct shm_control *ctrl;    // 控制块指针
+    struct controlflow_batch *data_area; // 数据区指针
 };
 
-// 共享内存操作函数
+__attribute__((visibility("default"))) 
+void add_controlflow_entry(uint64_t source_id, uint64_t offset);
+
+__attribute__((visibility("default")))
 struct shared_mem_ctx *init_shared_mem(int is_creator);
-void write_controlflow_data(struct shared_mem_ctx *ctx, struct controlflow_batch *batch);
+
 void read_controlflow_data(struct shared_mem_ctx *ctx);
 void cleanup_shared_mem(struct shared_mem_ctx *ctx);
 
-#endif // AGENT_H
+#ifdef __cplusplus
+}
+#endif
+#endif

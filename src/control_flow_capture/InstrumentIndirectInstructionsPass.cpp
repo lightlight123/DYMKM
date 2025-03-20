@@ -10,6 +10,8 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Analysis/DominanceFrontier.h"
 #include "llvm/Analysis/PostDominators.h"
+#include <llvm/IR/Intrinsics.h>  // 必须包含此头文件
+#include <llvm/IR/DerivedTypes.h>  // 必须包含PointerType定义
 
 using namespace llvm;
 
@@ -142,32 +144,11 @@ private:
         });
     }
 
-    Value* emitReturnAddress(IRBuilder<>& Builder, LLVMContext& Ctx) {
-        Module* M = Builder.GetInsertBlock()->getModule();
-        
-        // 获取不透明指针类型（LLVM 15+默认模式）
-        Type* RetAddrTy = PointerType::getUnqual(Ctx); // 使用上下文无关的指针类型
-        
-        // 声明returnaddress内置函数（返回类型为ptr）
-        Function* ReturnAddrFunc = Intrinsic::getDeclaration(
-            M,
-            Intrinsic::returnaddress,
-            { RetAddrTy }  // 关键：必须指定返回类型为ptr
-        );
-    
-        // 生成调用指令
-        CallInst* Call = Builder.CreateCall(
-            ReturnAddrFunc->getFunctionType(),
-            ReturnAddrFunc,
-            { Builder.getInt32(0) },
-            "retaddr"
-        );
-    
-        // 设置属性（优化兼容性）
-        Call->addFnAttr(Attribute::NoUnwind);
-        Call->setCallingConv(CallingConv::C);
-    
-        return Call;
+    Value *emitReturnAddress(IRBuilder<> &Builder, LLVMContext &Ctx) {
+        // 调用 LLVM 的 intrinsic 来获取返回地址
+        Function *ReturnAddrFunc = Intrinsic::getDeclaration(
+            Builder.GetInsertBlock()->getModule(), Intrinsic::returnaddress);
+        return Builder.CreateCall(ReturnAddrFunc, {Builder.getInt32(0)});
     }
 
     FunctionCallee getOrInsertAddControlFlowEntry(Module &M) {
