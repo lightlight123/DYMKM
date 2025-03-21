@@ -10,69 +10,109 @@
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Analysis/DominanceFrontier.h"
 #include "llvm/Analysis/PostDominators.h"
-#include <llvm/IR/Intrinsics.h>  // 必须包含此头文件
-#include <llvm/IR/DerivedTypes.h>  // 必须包含PointerType定义
+#include <llvm/IR/Intrinsics.h>
+#include <llvm/IR/DerivedTypes.h>
 
 using namespace llvm;
 
 extern "C" {
-    void init_shared_mem(int is_creator);  // 参数类型应为int
-    void add_controlflow_entry(uint64_t source_id, uint64_t offset);
+    void init_shared_mem(int is_creator);
+    void add_controlflow_entry(uint64_t source_bbid, uint64_t src_module_base, uint64_t target_offset);
 }
 
 class ControlFlowInstrumentPass : public PassInfoMixin<ControlFlowInstrumentPass> {
 private:
-    GlobalVariable *BaseAddrGV = nullptr;
+    GlobalVariable *SrcBaseGV = nullptr;
+    GlobalVariable *TargetBaseGV = nullptr;
+    DenseMap<Function*, unsigned> BBIDCounter;
+
+    uint64_t getBasicBlockID(BasicBlock &BB) {
+        Function *F = BB.getParent();
+        if (!BBIDCounter.count(F)) BBIDCounter[F] = 0;
+    
+        uint64_t funcHash = hashFunction(*F);
+        unsigned id = BBIDCounter[F]++;
+        return (funcHash << 32) | id;
+    }
+
+    void initBaseAddressGlobal(Module &M, bool isSource) {
+        GlobalVariable **GV = isSource ? &SrcBaseGV : &TargetBaseGV;
+        if (*GV) return;
+    
+        LLVMContext &Ctx = M.getContext();
+        *GV = new GlobalVariable(
+            M, Type::getInt64Ty(Ctx), false,
+            GlobalValue::LinkOnceODRLinkage,
+            ConstantInt::get(Type::getInt64Ty(Ctx), 0),
+            isSource ? "__src_module_base" : "__target_module_base"
+        );
+        (*GV)->setAlignment(Align(8));
+        (*GV)->setVisibility(GlobalValue::HiddenVisibility);
+    }
+    
+    void emitBaseAddressInit(IRBuilder<> &Builder, GlobalVariable *GV, bool isSource) {
+        Module *M = Builder.GetInsertBlock()->getModule();
+        StringRef AnchorName = isSource ? "__src_module_anchor" : "__target_module_anchor";
+        
+        Function *AnchorFunc = M->getFunction(AnchorName);
+        if (!AnchorFunc) {
+            AnchorFunc = Function::Create(
+                FunctionType::get(Type::getVoidTy(M->getContext()), false),
+                GlobalValue::InternalLinkage,
+                AnchorName,
+                M
+            );
+            BasicBlock *Entry = BasicBlock::Create(M->getContext(), "entry", AnchorFunc);
+            IRBuilder<> AnchorBuilder(Entry);
+            AnchorBuilder.CreateRetVoid();
+        }
+    
+        Value *BaseAddr = Builder.CreatePtrToInt(AnchorFunc, Builder.getInt64Ty());
+        Builder.CreateStore(BaseAddr, GV);
+    }
 
 public:
-    // 优化全局构造函数插入
     void addGlobalInitializer(Module &M) {
         if (M.getFunction("cf_initializer")) return;
 
         LLVMContext &Ctx = M.getContext();
         IRBuilder<> Builder(Ctx);
-
-         // 添加extern声明
-        FunctionType *InitType = FunctionType::get(Builder.getVoidTy(), {Builder.getInt32Ty()}, false);
-        Function::Create(InitType, GlobalValue::ExternalLinkage, "init_shared_mem", &M);
-
-        FunctionType *CtorType = FunctionType::get(Builder.getVoidTy(), false);
-        Function *Ctor = Function::Create(CtorType, 
-            GlobalValue::InternalLinkage, "cf_initializer", &M);
         
+        Function *Ctor = Function::Create(
+            FunctionType::get(Builder.getVoidTy(), false),
+            GlobalValue::InternalLinkage,
+            "cf_initializer",
+            &M
+        );
         BasicBlock *BB = BasicBlock::Create(Ctx, "entry", Ctor);
         Builder.SetInsertPoint(BB);
-        
+
+        initBaseAddressGlobal(M, true);
+        emitBaseAddressInit(Builder, SrcBaseGV, true);
+        initBaseAddressGlobal(M, false);
+        emitBaseAddressInit(Builder, TargetBaseGV, false);
+
         FunctionCallee InitFunc = M.getOrInsertFunction(
             "init_shared_mem",
             FunctionType::get(Type::getVoidTy(Ctx), {Type::getInt32Ty(Ctx)}, false)
         );
         Builder.CreateCall(InitFunc, {ConstantInt::get(Type::getInt32Ty(Ctx), 0)});
         Builder.CreateRetVoid();
-        
         appendToGlobalCtors(M, Ctor, 0);
     }
 
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
         addGlobalInitializer(M);
-        initBaseAddressGlobal(M);
+        assert(SrcBaseGV && TargetBaseGV && "Global variables not initialized!");
+
         FunctionCallee AddCFEntry = getOrInsertAddControlFlowEntry(M);
-        
-        FunctionAnalysisManager &FAM = 
-        AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
-
-
         for (Function &F : M) {
             if (F.isDeclaration()) continue;
-            
-            DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
-            
-            uint64_t funcHash = hashFunction(F);
-            
             for (BasicBlock &BB : F) {
+                uint64_t bbID = getBasicBlockID(BB);
                 for (Instruction &I : BB) {
                     if (shouldInstrument(I)) {
-                        instrumentInstruction(I, F, DT, AddCFEntry, funcHash);
+                        instrumentInstruction(I, bbID, AddCFEntry);
                     }
                 }
             }
@@ -81,88 +121,116 @@ public:
     }
 
 private:
-    void initBaseAddressGlobal(Module &M) {
-        if (BaseAddrGV) return;
-        
-        LLVMContext &Ctx = M.getContext();
-        BaseAddrGV = new GlobalVariable(
-            M, Type::getInt64Ty(Ctx), false,
-            GlobalValue::LinkOnceODRLinkage,
-            ConstantInt::get(Type::getInt64Ty(Ctx), 0),
-            "__cfi_module_base",
-            nullptr,
-            GlobalVariable::NotThreadLocal,
-            0
-        );
-        BaseAddrGV->setAlignment(Align(8));
-        BaseAddrGV->setVisibility(GlobalValue::HiddenVisibility);
-    }
+    void emitDebugInfo(IRBuilder<> &Builder, uint64_t bbID, 
+        Value* SrcBase, Value* TargetBase, Value* TargetAddr, Value* TargetOffset) {
+        Module *M = Builder.GetInsertBlock()->getModule();
+        LLVMContext &Ctx = M->getContext();
 
-    uint64_t hashFunction(Function &F) {
-        return std::hash<std::string>{}(F.getName().str());
+        PointerType *PrintfArgTy = PointerType::getUnqual(Type::getInt8Ty(Ctx));
+        FunctionType *PrintfTy = FunctionType::get(
+            Type::getInt32Ty(Ctx), PrintfArgTy, true);
+        FunctionCallee PrintfFn = M->getOrInsertFunction("printf", PrintfTy);
+
+        Constant *FormatStr = Builder.CreateGlobalStringPtr(
+            "[DEBUG] BBID=0x%lx\n"
+            "  SrcBase=0x%lx\n"
+            "  TargetBase=0x%lx\n"
+            "  TargetAddr=0x%lx\n"
+            "  Offset=0x%lx (验证结果: %s)\n\n");
+
+        Value *ComputedOffset = Builder.CreateSub(TargetAddr, TargetBase);
+        Value *OffsetValid = Builder.CreateICmpEQ(ComputedOffset, TargetOffset);
+        Value *ValidStr = Builder.CreateSelect(OffsetValid,
+            Builder.CreateGlobalStringPtr("有效"),
+            Builder.CreateGlobalStringPtr("无效"));
+
+        Value* Args[] = {
+            FormatStr,
+            ConstantInt::get(Builder.getInt64Ty(), bbID),
+            SrcBase,
+            TargetBase,
+            TargetAddr,
+            TargetOffset,
+            ValidStr
+        };
+
+        Builder.CreateCall(PrintfFn, Args);
     }
 
     bool shouldInstrument(Instruction &I) {
-        if (auto *CB = dyn_cast<CallBase>(&I)) {
-            if (Function *F = CB->getCalledFunction()) {
-                if (F->isIntrinsic() || F->getName().starts_with("llvm."))
-                    return false;
-            }
+        // 仅保留间接函数调用、间接跳转、返回指令
+        if (auto *CI = dyn_cast<CallBase>(&I)) {
+            return CI->isIndirectCall(); // 仅捕获间接调用
         }
-        return isa<CallBase>(I) || isa<IndirectBrInst>(I) || isa<ReturnInst>(I);
+        return isa<IndirectBrInst>(I) || isa<ReturnInst>(I); // 捕获间接跳转和返回指令
     }
-
-    void instrumentInstruction(Instruction &I, Function &F, DominatorTree &DT,
-                              FunctionCallee AddCFEntry, uint64_t funcHash) {
+    
+    void instrumentInstruction(Instruction &I, uint64_t bbID, FunctionCallee AddCFEntry) {
         IRBuilder<> Builder(&I);
         Value *TargetAddr = nullptr;
-
+    
+        // 处理间接函数调用
         if (auto *CI = dyn_cast<CallBase>(&I)) {
-            TargetAddr = CI->getCalledOperand();
-        } else if (auto *IBI = dyn_cast<IndirectBrInst>(&I)) {
+            if (CI->isIndirectCall()) { // 确保是间接调用
+                TargetAddr = CI->getCalledOperand();
+            }
+        } 
+        // 处理间接跳转
+        else if (auto *IBI = dyn_cast<IndirectBrInst>(&I)) {
             TargetAddr = IBI->getAddress();
-        } else if (auto *RI = dyn_cast<ReturnInst>(&I)) {
-            TargetAddr = emitReturnAddress(Builder, F.getContext());
-        } else {
-            return;
+        } 
+        // 处理返回指令
+        else if (auto *RI = dyn_cast<ReturnInst>(&I)) {
+            TargetAddr = getReturnAddress(Builder);
         }
-
-        if (!TargetAddr->getType()->isPointerTy()) return;
-
-        // 生成稳定的基地址计算
-        Value *BaseAddr = Builder.CreateLoad(
-            Type::getInt64Ty(F.getContext()), BaseAddrGV, "module_base");
-        
-        // 确保地址计算发生在当前指令之前
-        Value *TargetInt = Builder.CreatePtrToInt(TargetAddr, Builder.getInt64Ty(), "target_int");
-        Value *OffsetValue = Builder.CreateSub(TargetInt, BaseAddr, "cfi_offset");
-
-        // 创建插桩调用
+    
+        // 如果没有目标地址或者目标地址不是指针类型，则不进行插装
+        if (!TargetAddr || !TargetAddr->getType()->isPointerTy()) return;
+    
+        // 将指针转换为整数类型
+        Value *TargetInt = Builder.CreatePtrToInt(TargetAddr, Builder.getInt64Ty());
+        Value *SrcBase = Builder.CreateLoad(SrcBaseGV->getValueType(), SrcBaseGV);
+        Value *TargetBase = Builder.CreateLoad(TargetBaseGV->getValueType(), TargetBaseGV);
+        Value *TargetOffset = Builder.CreateSub(TargetInt, TargetBase);
+    
+        // 记录调试信息
+        emitDebugInfo(Builder, bbID, SrcBase, TargetBase, TargetInt, TargetOffset);
+    
+        // 生成插装代码，调用 AddCFEntry 记录控制流信息
         Builder.CreateCall(AddCFEntry, {
-            ConstantInt::get(Builder.getInt64Ty(), funcHash),
-            OffsetValue
+            ConstantInt::get(Builder.getInt64Ty(), bbID),
+            SrcBase,
+            TargetOffset
         });
     }
-
-    Value *emitReturnAddress(IRBuilder<> &Builder, LLVMContext &Ctx) {
-        // 调用 LLVM 的 intrinsic 来获取返回地址
-        Function *ReturnAddrFunc = Intrinsic::getDeclaration(
-            Builder.GetInsertBlock()->getModule(), Intrinsic::returnaddress);
-        return Builder.CreateCall(ReturnAddrFunc, {Builder.getInt32(0)});
+    
+    Value *getReturnAddress(IRBuilder<> &Builder) {
+        Function *ReturnAddrFn = Intrinsic::getDeclaration(
+            Builder.GetInsertBlock()->getModule(), 
+            Intrinsic::returnaddress
+        );
+        return Builder.CreateCall(ReturnAddrFn, {Builder.getInt32(0)});
     }
 
     FunctionCallee getOrInsertAddControlFlowEntry(Module &M) {
         LLVMContext &Ctx = M.getContext();
-        Type *ArgTypes[] = {Type::getInt64Ty(Ctx), Type::getInt64Ty(Ctx)};
+        Type *ArgTypes[] = {Type::getInt64Ty(Ctx), Type::getInt64Ty(Ctx), Type::getInt64Ty(Ctx)};
         FunctionType *FuncType = FunctionType::get(Type::getVoidTy(Ctx), ArgTypes, false);
         return M.getOrInsertFunction("add_controlflow_entry", FuncType);
+    }
+
+    uint64_t hashFunction(Function &F) {
+        std::string Identifier = F.getName().str() + 
+                               F.getParent()->getSourceFileName() + 
+                               std::to_string(reinterpret_cast<uintptr_t>(&F));
+        return std::hash<std::string>{}(Identifier);
     }
 };
 
 extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
     return {
         LLVM_PLUGIN_API_VERSION,
-        "InstrumentIndirectInstructions",
+        "CFGInstrumentation",
         LLVM_VERSION_STRING,
         [](PassBuilder &PB) {
             PB.registerPipelineParsingCallback(

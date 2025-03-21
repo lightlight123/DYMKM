@@ -42,7 +42,7 @@ struct shared_mem_ctx {
 };
 
 __attribute__((visibility("default"))) 
-void add_controlflow_entry(uint64_t source_id, uint64_t offset);
+void add_controlflow_entry(uint64_t source_bbid, uint64_t src_module_base, uint64_t target_offset);
 
 __attribute__((visibility("default")))
 struct shared_mem_ctx *init_shared_mem(int is_creator);
